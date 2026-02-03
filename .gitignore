@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+.uv/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment
+.env
+.env.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+*.bak
+
+# Rhino
+*.3dm.rhl
+*.3dm~
+*.3dmbak
+
+# Grasshopper
+*.gh~
+*.ghx~
+
+# C# Build
+bin/
+obj/
+*.dll
+*.pdb
+*.user
+*.suo
+*.cache
+.vs/
+
+# Logs
+logs/
+*.log
+
+# UV
+uv.lock
