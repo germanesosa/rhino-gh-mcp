@@ -284,6 +284,8 @@ class GrasshopperTools:
         self.app.tool()(self.remove_node)
         self.app.tool()(self.set_component_parameter)
         self.app.tool()(self.get_panel_content)
+        self.app.tool()(self.get_component_errors)
+        self.app.tool()(self.batch_connect)
     
     def is_server_available(self, ctx: Context) -> bool:
         """Grasshopper: Check if the Grasshopper server is available.
@@ -389,17 +391,18 @@ class GrasshopperTools:
         except Exception as e:
             return f"Error executing code: {str(e)}"
 
-    def get_gh_context(self, ctx: Context, simplified: bool = False) -> str:
+    def get_gh_context(self, ctx: Context, simplified: bool = True) -> str:
         """Grasshopper: Get current Grasshopper document state and definition graph, sorted by execution order.
-        
+
         Returns a JSON string containing:
         - Component graph (connections between components)
         - Component info (guid, name, type)
         - Component properties and parameters
-        
+
         Args:
-            simplified: When true, returns minimal component info without detailed properties
-        
+            simplified: When true (default), returns minimal component info (guid, name, kind, connections, errors only).
+                        Set to false for full details including descriptions, access, optional flags.
+
         Returns:
             JSON string with grasshopper definition graph
         """
@@ -409,10 +412,20 @@ class GrasshopperTools:
             result = connection.send_command("get_context", {
                 "simplified": simplified
             })
-            
+
             if result.get("status") == "error":
                 return f"Error: {result.get('result', 'Unknown error')}"
-            return json.dumps(result.get("result", {}), indent=2)
+
+            data = result.get("result", {})
+            # Safety: strip verbose fields even if C# didn't simplify
+            if simplified and isinstance(data, dict):
+                for guid, comp_info in data.items():
+                    if isinstance(comp_info, dict):
+                        comp_info.pop("description", None)
+                        comp_info.pop("category", None)
+                        comp_info.pop("subCategory", None)
+                        comp_info.pop("isSelected", None)
+            return json.dumps(data, indent=2)
                 
         except Exception as e:
             return f"Error getting context: {str(e)}"
@@ -796,10 +809,15 @@ class GrasshopperTools:
     def get_all_component_proxies(self, ctx: Context, limit: int = 1000, filter: Optional[Union[str, Dict[str, str]]] = None, refresh: bool = False) -> str:
         """Get all Grasshopper component information (with caching and filtering), returned as a nested JSON grouped by Category and SubCategory: {Category: {SubCategory: [component_dicts]}}. The filter can be a string (name filter) or a dict with 'name' and/or 'category' keys (substring match, case-insensitive)."""
         connection = get_grasshopper_connection()
+        # Pass filter as string to C# side for name/category substring matching
+        filter_str = None
+        if isinstance(filter, str):
+            filter_str = filter
+        elif isinstance(filter, dict):
+            filter_str = filter.get("name", "") or filter.get("category", "")
         result = connection.send_command("get_all_component_proxies", {
             "limit": limit,
-            # "filter": filter,
-            # "filter": {"category": "MCP"},
+            "filter": filter_str,
             "refresh": refresh
         })
         return json.dumps(result, indent=2)
@@ -889,3 +907,54 @@ class GrasshopperTools:
                 
         except Exception as e:
             return json.dumps({"status": "error", "result": f"Error getting panel content: {str(e)}"})
+
+    def get_component_errors(self, ctx: Context, instance_guid: str) -> str:
+        """Grasshopper: Get runtime messages (errors, warnings) for a specific component.
+
+        Lightweight alternative to expire_and_get_info — returns only error/warning messages
+        without full component info. Use this to quickly check if a component has problems.
+
+        Args:
+            instance_guid: The GUID of the component to check
+
+        Returns:
+            JSON with errors and warnings arrays, hasErrors flag
+        """
+        try:
+            connection = get_grasshopper_connection()
+            result = connection.send_command("get_component_errors", {
+                "instance_guid": instance_guid
+            })
+            if result.get("status") == "error":
+                return json.dumps({"status": "error", "result": result.get('result', 'Unknown error')})
+            return json.dumps(result.get("result", {}), indent=2)
+        except Exception as e:
+            return json.dumps({"status": "error", "result": f"Error: {str(e)}"})
+
+    def batch_connect(self, ctx: Context, connections: list) -> str:
+        """Grasshopper: Connect multiple component ports in a single operation.
+
+        Much more efficient than calling connect_components multiple times.
+        All connections are made in one UI thread dispatch (single round-trip).
+
+        Note: Unlike connect_components, this does NOT clear existing sources —
+        it adds connections additively.
+
+        Args:
+            connections: List of connection dicts, each with:
+                - source_guid: GUID of the source component
+                - source_output: Name of the source output parameter
+                - target_guid: GUID of the target component
+                - target_input: Name of the target input parameter
+
+        Returns:
+            JSON with connection results: {connected: N, failed: N, errors: [...]}
+        """
+        try:
+            connection = get_grasshopper_connection()
+            result = connection.send_command("batch_connect", {
+                "connections": connections
+            })
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return json.dumps({"status": "error", "result": f"Error: {str(e)}"})

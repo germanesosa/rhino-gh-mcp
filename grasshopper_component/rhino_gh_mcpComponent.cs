@@ -44,7 +44,7 @@ namespace rhino_gh_mcp
             // All parameters must have the correct access type. If you want 
             // to import lists or trees of values, modify the ParamAccess flag.
             pManager.AddBooleanParameter("RunServer", "Run", "Start/stop the MCP server", GH_ParamAccess.item, false);
-            pManager.AddTextParameter("CategoryFilter", "Filter", "Component category filter (optional)", GH_ParamAccess.item, "MCP");
+            pManager.AddTextParameter("CategoryFilter", "Filter", "Component category filter (optional, comma-separated. Empty = all)", GH_ParamAccess.item, "");
             // Expose SetParameterMode as an integer input (optional, default 0)
             pManager.AddIntegerParameter("SetParameterMode", "SetParamMode", "0 or empty: panel mode (default), 1: interactive UI mode (slider if present, else panel), 2: volatile data mode (always)", GH_ParamAccess.item, 0);
             // Add RecomputeAll boolean input
@@ -419,6 +419,12 @@ namespace rhino_gh_mcp
                     case "get_panel_content":
                         result = GetPanelContent(cmd);
                         break;
+                    case "get_component_errors":
+                        result = GetComponentErrors(cmd);
+                        break;
+                    case "batch_connect":
+                        result = BatchConnect(cmd);
+                        break;
                     default:
                         return ErrorResponse($"Unknown command type: {type}");
                 }
@@ -427,8 +433,8 @@ namespace rhino_gh_mcp
                 if (currentAutoRecompute && result != null && result["status"]?.ToString() == "success")
                 {
                     // Don't auto-recompute for certain commands that don't modify the document
-                    var readOnlyCommands = new[] { "get_context", "get_objects", "get_selected", "get_all_component_proxies", 
-                                                    "get_all_component_library", "get_debug_log", "is_server_available", "get_panel_content" };
+                    var readOnlyCommands = new[] { "get_context", "get_objects", "get_selected", "get_all_component_proxies",
+                                                    "get_all_component_library", "get_debug_log", "is_server_available", "get_panel_content", "get_component_errors" };
                     if (!readOnlyCommands.Contains(type))
                     {
                         var recomputeResult = RecomputeAll(new JObject());
@@ -460,25 +466,14 @@ namespace rhino_gh_mcp
                 {
                     var doc = GetGHDocument();
                     var server = Grasshopper.Instances.ComponentServer;
-                    // Support multiple categories separated by commas
-                    List<string> categories = null;
-                    if (!string.IsNullOrWhiteSpace(currentCategoryFilter))
-                    {
-                        categories = currentCategoryFilter.Split(',')
-                            .Select(c => c.Trim())
-                            .Where(c => !string.IsNullOrEmpty(c))
-                            .ToList();
-                    }
+                    // No category filtering - allow all components from any plugin
                     var proxy = server.ObjectProxies.FirstOrDefault(p =>
                         p?.Desc != null &&
-                        (categories == null || categories.Count == 0
-                            ? true // No filter, allow any category
-                            : categories.Any(cat => (p.Desc.Category ?? "").Equals(cat, StringComparison.OrdinalIgnoreCase))) &&
                         (p.Desc.Name == name || p.Desc.NickName == name)
                     );
                     if (proxy == null)
                     {
-                        result = new JObject { ["status"] = "error", ["result"] = $"Component '{name}' not found in allowed categories '{currentCategoryFilter}'." };
+                        result = new JObject { ["status"] = "error", ["result"] = $"Component '{name}' not found." };
                     }
                     else
                     {
@@ -548,6 +543,7 @@ namespace rhino_gh_mcp
         }
         private JObject GetContext(JObject cmd)
         {
+            bool simplified = (bool?)(cmd["simplified"] ?? false) ?? false;
             JObject result = null;
             Exception error = null;
             var done = new System.Threading.ManualResetEventSlim(false);
@@ -561,9 +557,9 @@ namespace rhino_gh_mcp
                     foreach (var obj in doc.Objects)
                     {
                         if (obj is IGH_Component comp)
-                            all[comp.InstanceGuid.ToString()] = GetComponentInfo(comp);
+                            all[comp.InstanceGuid.ToString()] = simplified ? GetComponentInfoSimplified(comp) : GetComponentInfo(comp);
                         else if (obj is IGH_Param param && param.Attributes?.Parent == null)
-                            all[param.InstanceGuid.ToString()] = GetParamInfo(param, false, null, false);
+                            all[param.InstanceGuid.ToString()] = simplified ? GetParamInfoSimplified(param) : GetParamInfo(param, false, null, false);
                     }
                     result = new JObject { ["status"] = "success", ["result"] = all };
                 }
@@ -577,7 +573,7 @@ namespace rhino_gh_mcp
                 }
             });
 
-            done.Wait(5000);
+            done.Wait(15000);
             if (error != null) return ErrorResponse($"Error getting context: {error.Message}");
             return result ?? ErrorResponse("Operation timed out");
         }
@@ -662,7 +658,7 @@ namespace rhino_gh_mcp
                 }
             });
 
-            done.Wait(5000);
+            done.Wait(10000);
             if (error != null) return ErrorResponse($"Error getting objects: {error.Message}");
             return result ?? ErrorResponse("Operation timed out");
         }
@@ -903,6 +899,7 @@ namespace rhino_gh_mcp
         private JObject GetAllComponentProxies(JObject cmd)
         {
             int limit = (int?)(cmd["limit"] ?? 1000) ?? 1000;
+            string filterStr = (string)cmd["filter"];
             JObject result = null;
             Exception error = null;
             var done = new System.Threading.ManualResetEventSlim(false);
@@ -920,15 +917,7 @@ namespace rhino_gh_mcp
                             return;
                         }
 
-                        // Support multiple categories separated by commas
-                        List<string> categories = null;
-                        if (!string.IsNullOrWhiteSpace(currentCategoryFilter))
-                        {
-                            categories = currentCategoryFilter.Split(',')
-                                .Select(c => c.Trim())
-                                .Where(c => !string.IsNullOrEmpty(c))
-                                .ToList();
-                        }
+                        // No category filtering - allow all plugins. Optional name/text filter.
                         int retries = 0;
                         int maxRetries = 3;
                         int proxyCount = 0;
@@ -939,11 +928,11 @@ namespace rhino_gh_mcp
                             {
                                 proxies = server.ObjectProxies
                                     .Where(p => p?.Desc != null &&
-                                        (
-                                            categories == null || categories.Count == 0
-                                            ? true // No filter, fetch all
-                                            : categories.Any(cat => (p.Desc.Category ?? "").Equals(cat, StringComparison.OrdinalIgnoreCase))
-                                        )
+                                        (string.IsNullOrEmpty(filterStr) ||
+                                         (p.Desc.Name ?? "").IndexOf(filterStr, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                         (p.Desc.NickName ?? "").IndexOf(filterStr, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                         (p.Desc.Category ?? "").IndexOf(filterStr, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                         (p.Desc.SubCategory ?? "").IndexOf(filterStr, StringComparison.OrdinalIgnoreCase) >= 0)
                                     )
                                     .Take(limit)
                                     .ToList();
@@ -1117,6 +1106,36 @@ namespace rhino_gh_mcp
             o["optional"] = param.Optional;
             o["sources"] = new JArray(param.Sources.Select(s => s.InstanceGuid.ToString()));
             o["targets"] = new JArray(param.Recipients.Select(r => r.InstanceGuid.ToString()));
+            return o;
+        }
+
+        // --- Simplified info helpers (minimal payload for get_context simplified=true) ---
+        private JObject GetComponentInfoSimplified(IGH_Component comp)
+        {
+            var o = new JObject();
+            o["instanceGuid"] = comp.InstanceGuid.ToString();
+            o["name"] = comp.Name;
+            o["nickName"] = comp.NickName;
+            o["kind"] = comp.GetType().Name;
+            // Check for runtime errors
+            var errors = comp.RuntimeMessages(GH_RuntimeMessageLevel.Error);
+            if (errors != null && errors.Count > 0)
+                o["errors"] = new JArray(errors);
+            o["Inputs"] = new JArray(comp.Params.Input.Select(p => GetParamInfoSimplified(p)));
+            o["Outputs"] = new JArray(comp.Params.Output.Select(p => GetParamInfoSimplified(p)));
+            return o;
+        }
+        private JObject GetParamInfoSimplified(IGH_Param param)
+        {
+            var o = new JObject();
+            o["instanceGuid"] = param.InstanceGuid.ToString();
+            o["nickName"] = param.NickName;
+            var sources = param.Sources.Select(s => s.InstanceGuid.ToString()).ToList();
+            if (sources.Count > 0)
+                o["sources"] = new JArray(sources);
+            var targets = param.Recipients.Select(r => r.InstanceGuid.ToString()).ToList();
+            if (targets.Count > 0)
+                o["targets"] = new JArray(targets);
             return o;
         }
 
@@ -1390,8 +1409,250 @@ namespace rhino_gh_mcp
 
         private JObject ExecuteCode(JObject cmd)
         {
-            // Not supported in C# context
-            return ErrorResponse("execute_code is not supported in C# MCP server.");
+            string code = (string)cmd["code"];
+            if (string.IsNullOrWhiteSpace(code))
+                return ErrorResponse("No code provided.");
+
+            JObject result = null;
+            Exception error = null;
+            var done = new System.Threading.ManualResetEventSlim(false);
+
+            RunOnUiThread(() =>
+            {
+                try
+                {
+                    var doc = GetGHDocument();
+
+                    // Find existing temp script component or create one
+                    IGH_Component scriptComp = null;
+                    foreach (var obj in doc.Objects)
+                    {
+                        if (obj is IGH_Component c && c.NickName == "__mcp_exec__"
+                            && c.GetType().GetProperty("Code") != null)
+                        {
+                            scriptComp = c;
+                            break;
+                        }
+                    }
+
+                    if (scriptComp == null)
+                    {
+                        var server = Grasshopper.Instances.ComponentServer;
+                        var proxy = server.ObjectProxies.FirstOrDefault(p =>
+                            p?.Desc != null &&
+                            (p.Desc.Name == "GhPython Script" || p.Desc.Name == "Python 3 Script"));
+
+                        if (proxy == null)
+                        {
+                            result = ErrorResponse("No Python script component available.");
+                            return;
+                        }
+
+                        scriptComp = proxy.CreateInstance() as IGH_Component;
+                        if (scriptComp == null)
+                        {
+                            result = ErrorResponse("Failed to create Python script component.");
+                            return;
+                        }
+                        scriptComp.CreateAttributes();
+                        scriptComp.NickName = "__mcp_exec__";
+                        scriptComp.Attributes.Pivot = new System.Drawing.PointF(-5000, -5000);
+                        doc.AddObject(scriptComp, false);
+                    }
+
+                    // Set code
+                    var codeProp = scriptComp.GetType().GetProperty("Code");
+                    if (codeProp == null || !codeProp.CanWrite)
+                    {
+                        result = ErrorResponse("Script component does not support Code property.");
+                        return;
+                    }
+                    codeProp.SetValue(scriptComp, code, null);
+                    scriptComp.ExpireSolution(true);
+
+                    // Read outputs
+                    var outputData = new JObject();
+                    foreach (var outParam in scriptComp.Params.Output)
+                    {
+                        if (outParam.VolatileData != null && outParam.VolatileData.DataCount > 0)
+                        {
+                            var items = new List<string>();
+                            foreach (var path in outParam.VolatileData.Paths)
+                            {
+                                var branch = outParam.VolatileData.get_Branch(path);
+                                foreach (var item in branch)
+                                    if (item != null) items.Add(item.ToString());
+                            }
+                            outputData[outParam.NickName] = items.Count == 1 ? (JToken)items[0] : new JArray(items);
+                        }
+                    }
+
+                    // Check for errors
+                    var errors = scriptComp.RuntimeMessages(GH_RuntimeMessageLevel.Error);
+                    var warnings = scriptComp.RuntimeMessages(GH_RuntimeMessageLevel.Warning);
+
+                    var resultObj = new JObject { ["output"] = outputData };
+                    if (errors != null && errors.Count > 0)
+                        resultObj["errors"] = new JArray(errors);
+                    if (warnings != null && warnings.Count > 0)
+                        resultObj["warnings"] = new JArray(warnings);
+
+                    result = new JObject
+                    {
+                        ["status"] = (errors != null && errors.Count > 0) ? "error" : "success",
+                        ["result"] = resultObj
+                    };
+                }
+                catch (Exception ex)
+                {
+                    error = ex;
+                }
+                finally
+                {
+                    done.Set();
+                }
+            });
+
+            done.Wait(15000);
+            if (error != null) return ErrorResponse($"Error executing code: {error.Message}");
+            return result ?? ErrorResponse("Operation timed out");
+        }
+
+        private JObject GetComponentErrors(JObject cmd)
+        {
+            string guid = (string)cmd["instance_guid"];
+            if (string.IsNullOrEmpty(guid))
+                return ErrorResponse("No instance_guid provided.");
+
+            JObject result = null;
+            Exception error = null;
+            var done = new System.Threading.ManualResetEventSlim(false);
+
+            RunOnUiThread(() =>
+            {
+                try
+                {
+                    var doc = GetGHDocument();
+                    var obj = doc.FindObject(new Guid(guid), true);
+                    if (obj == null)
+                    {
+                        result = ErrorResponse("Object not found.");
+                        return;
+                    }
+                    if (obj is IGH_ActiveObject activeObj)
+                    {
+                        var messages = new JObject();
+                        var errors = new JArray();
+                        var warnings = new JArray();
+                        foreach (var msg in activeObj.RuntimeMessages(GH_RuntimeMessageLevel.Error))
+                            errors.Add(msg);
+                        foreach (var msg in activeObj.RuntimeMessages(GH_RuntimeMessageLevel.Warning))
+                            warnings.Add(msg);
+                        messages["errors"] = errors;
+                        messages["warnings"] = warnings;
+                        messages["hasErrors"] = errors.Count > 0;
+                        messages["instanceGuid"] = guid;
+                        messages["name"] = activeObj.Name;
+                        result = new JObject { ["status"] = "success", ["result"] = messages };
+                    }
+                    else
+                    {
+                        result = ErrorResponse("Object does not support runtime messages.");
+                    }
+                }
+                catch (Exception ex) { error = ex; }
+                finally { done.Set(); }
+            });
+
+            done.Wait(5000);
+            if (error != null) return ErrorResponse($"Error: {error.Message}");
+            return result ?? ErrorResponse("Operation timed out");
+        }
+
+        private JObject BatchConnect(JObject cmd)
+        {
+            JArray connections = (JArray)cmd["connections"];
+            if (connections == null || connections.Count == 0)
+                return ErrorResponse("No connections provided.");
+
+            JObject result = null;
+            Exception error = null;
+            var done = new System.Threading.ManualResetEventSlim(false);
+
+            RunOnUiThread(() =>
+            {
+                try
+                {
+                    var doc = GetGHDocument();
+                    int successCount = 0;
+                    int errorCount = 0;
+                    var errors = new JArray();
+
+                    foreach (JObject conn in connections)
+                    {
+                        try
+                        {
+                            string srcGuid = (string)conn["source_guid"];
+                            string srcOut = (string)conn["source_output"];
+                            string tgtGuid = (string)conn["target_guid"];
+                            string tgtIn = (string)conn["target_input"];
+
+                            var src = doc.FindObject(new Guid(srcGuid), true);
+                            var tgt = doc.FindObject(new Guid(tgtGuid), true) as IGH_Component;
+
+                            if (src == null || tgt == null)
+                            {
+                                errors.Add($"Not found: {srcGuid} -> {tgtGuid}");
+                                errorCount++;
+                                continue;
+                            }
+
+                            IGH_Param srcParam = null;
+                            if (src is GH_NumberSlider || src is GH_Panel || src is GH_BooleanToggle)
+                                srcParam = src as IGH_Param;
+                            else if (src is IGH_Component sc)
+                                srcParam = sc.Params.Output.FirstOrDefault(p => p.NickName == srcOut || p.Name == srcOut);
+                            else if (src is IGH_Param sp)
+                                srcParam = sp;
+
+                            var tgtParam = tgt.Params.Input.FirstOrDefault(p => p.NickName == tgtIn || p.Name == tgtIn);
+
+                            if (srcParam == null || tgtParam == null)
+                            {
+                                errors.Add($"Params not found: {srcOut} -> {tgtIn}");
+                                errorCount++;
+                                continue;
+                            }
+
+                            tgtParam.AddSource(srcParam);
+                            successCount++;
+                        }
+                        catch (Exception ex)
+                        {
+                            errors.Add(ex.Message);
+                            errorCount++;
+                        }
+                    }
+
+                    var resultObj = new JObject
+                    {
+                        ["connected"] = successCount,
+                        ["failed"] = errorCount
+                    };
+                    if (errors.Count > 0) resultObj["errors"] = errors;
+                    result = new JObject
+                    {
+                        ["status"] = errorCount == 0 ? "success" : "partial",
+                        ["result"] = resultObj
+                    };
+                }
+                catch (Exception ex) { error = ex; }
+                finally { done.Set(); }
+            });
+
+            done.Wait(15000);
+            if (error != null) return ErrorResponse($"Error: {error.Message}");
+            return result ?? ErrorResponse("Operation timed out");
         }
 
         private JObject GetPanelContent(JObject cmd)
