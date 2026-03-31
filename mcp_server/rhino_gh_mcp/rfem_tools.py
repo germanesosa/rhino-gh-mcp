@@ -105,6 +105,9 @@ class RfemTools:
         self.app.tool()(self.rfem_calculate)
         self.app.tool()(self.rfem_get_results)
         self.app.tool()(self.rfem_update_members_section)
+        self.app.tool()(self.rfem_create_member_group)
+        self.app.tool()(self.rfem_get_member_groups)
+        self.app.tool()(self.rfem_update_group_section)
         self.app.tool()(self.rfem_execute_code)
 
     def rfem_check_connection(self) -> str:
@@ -668,6 +671,135 @@ class RfemTools:
                 "status": "success",
                 "message": "Se modificaron {} barras a sección {}".format(
                     len(modified), new_section_no),
+                "modified_members": modified,
+                "total_modified": len(modified)
+            })
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)})
+
+    def rfem_create_member_group(self, no: int, name: str, member_ids: str) -> str:
+        """Crear un grupo de barras (Member Set) con un nombre.
+
+        Los grupos son arbitrarios: las barras NO necesitan estar conectadas.
+        Podés agrupar por ejemplo todas las columnas del piso 1, o todas las
+        vigas en dirección X, etc.
+
+        Después usá rfem_update_group_section() para cambiar la sección
+        de todo el grupo de una.
+
+        Args:
+            no: Número del grupo (ID único)
+            name: Nombre descriptivo (ej: "Columnas Piso 1", "Vigas dir X")
+            member_ids: Números de barras separados por espacio (ej: "1 3 5 7 12")
+        """
+        conn = get_rfem_connection()
+        conn.ensure_connected()
+        try:
+            from RFEM.initModel import Model
+            client = Model.clientModel
+
+            # Crear el Member Set como tipo GROUP (barras no conectadas)
+            member_set = client.factory.create('ns0:member_set')
+            member_set.no = no
+            member_set.members = member_ids
+            member_set.set_type = "SET_TYPE_GROUP"
+            member_set.name = name
+
+            client.service.set_member_set(member_set)
+
+            return json.dumps({
+                "status": "success",
+                "message": "Grupo '{}' (#{}) creado con barras: {}".format(name, no, member_ids)
+            })
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)})
+
+    def rfem_get_member_groups(self) -> str:
+        """Listar todos los grupos de barras (Member Sets) del modelo.
+
+        Devuelve nombre, número y barras de cada grupo.
+        """
+        conn = get_rfem_connection()
+        conn.ensure_connected()
+        try:
+            from RFEM.initModel import Model
+            client = Model.clientModel
+
+            count = client.service.get_object_count("E_OBJECT_TYPE_MEMBER_SET", 0)
+            groups = []
+            for i in range(1, count + 1):
+                try:
+                    ms = client.service.get_member_set(i)
+                    groups.append({
+                        "no": i,
+                        "name": getattr(ms, 'name', ''),
+                        "members": getattr(ms, 'members', ''),
+                        "set_type": getattr(ms, 'set_type', ''),
+                    })
+                except Exception:
+                    continue
+
+            return json.dumps({
+                "status": "success",
+                "groups": groups,
+                "count": len(groups)
+            })
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)})
+
+    def rfem_update_group_section(self, group_no: int, new_section_no: int) -> str:
+        """Cambiar la sección de TODAS las barras de un grupo.
+
+        Ejemplo: "A todo el grupo 'Columnas Piso 1' subile la sección a HEA 300"
+
+        Args:
+            group_no: Número del grupo (Member Set)
+            new_section_no: Número de la nueva sección a asignar
+        """
+        conn = get_rfem_connection()
+        conn.ensure_connected()
+        try:
+            from RFEM.initModel import Model
+            client = Model.clientModel
+
+            # Obtener el grupo y sus barras
+            ms = client.service.get_member_set(group_no)
+            group_name = getattr(ms, 'name', 'Grupo {}'.format(group_no))
+            members_str = getattr(ms, 'members', '')
+
+            if not members_str:
+                return json.dumps({
+                    "status": "error",
+                    "message": "Grupo {} está vacío".format(group_no)
+                })
+
+            # Parsear IDs de barras del string (formato: "1 3 5 7" o "1-5")
+            member_ids = []
+            for part in str(members_str).split():
+                if '-' in part:
+                    start, end = part.split('-')
+                    member_ids.extend(range(int(start), int(end) + 1))
+                else:
+                    member_ids.append(int(part))
+
+            # Aplicar cambio de sección a cada barra
+            modified = []
+            for mid in member_ids:
+                try:
+                    member = client.service.get_member(mid)
+                    member.section_start = new_section_no
+                    member.section_end = new_section_no
+                    client.service.set_member(member)
+                    modified.append(mid)
+                except Exception as e:
+                    logger.warning("Error modificando barra {}: {}".format(mid, str(e)))
+                    continue
+
+            return json.dumps({
+                "status": "success",
+                "message": "Grupo '{}': {} barras cambiadas a sección {}".format(
+                    group_name, len(modified), new_section_no),
+                "group_name": group_name,
                 "modified_members": modified,
                 "total_modified": len(modified)
             })
