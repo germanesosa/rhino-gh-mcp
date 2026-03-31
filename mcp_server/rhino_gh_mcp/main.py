@@ -12,7 +12,7 @@ from . import server
 def parse_args():
     parser = argparse.ArgumentParser(description="RhinoMCP with UV - Main entry point")
     parser.add_argument('--tools', type=str, default="grasshopper",
-                        help="Comma-separated list of tools to load: rhino,grasshopper,replicate,utility (default: grasshopper)")
+                        help="Comma-separated list of tools to load: rhino,grasshopper,rfem (default: grasshopper)")
     return parser.parse_args()
 
 if __name__ == "__main__":
