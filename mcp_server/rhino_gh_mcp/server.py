@@ -24,6 +24,7 @@ except ImportError:
 # Import our tool modules
 from .rhino_tools import RhinoTools, get_rhino_connection
 from .grasshopper_tools import GrasshopperTools, get_grasshopper_connection
+from .rfem_tools import RfemTools, get_rfem_connection
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -35,6 +36,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     """Manage server startup and shutdown lifecycle"""
     rhino_conn = None
     gh_conn = None
+    rfem_conn = None
 
     try:
         logger.info("RhinoMCP server starting up")
@@ -58,6 +60,16 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         except Exception as e:
             logger.warning("Error checking Grasshopper server availability: {0}".format(str(e)))
 
+        # Try to connect to RFEM WebService
+        try:
+            rfem_conn = get_rfem_connection()
+            if rfem_conn.check_available():
+                logger.info("RFEM WebService is available at port {0}".format(rfem_conn.port))
+            else:
+                logger.warning("RFEM WebService not available. Enable it in RFEM: Options > Program Options > WebService I")
+        except Exception as e:
+            logger.warning("Error checking RFEM WebService availability: {0}".format(str(e)))
+
         yield {}
     finally:
         logger.info("RhinoMCP server shut down")
@@ -77,6 +89,13 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
             except Exception as e:
                 logger.warning("Error disconnecting from Grasshopper: {0}".format(str(e)))
 
+        if rfem_conn:
+            try:
+                rfem_conn.disconnect()
+                logger.info("Disconnected from RFEM WebService")
+            except Exception as e:
+                logger.warning("Error disconnecting from RFEM: {0}".format(str(e)))
+
 # Create the MCP server with lifespan support
 app = FastMCP(
     "RhinoMCP",
@@ -88,6 +107,7 @@ def load_tools(app, tool_names):
     tool_map = {
         "rhino": ("rhino_gh_mcp.rhino_tools", "RhinoTools"),
         "grasshopper": ("rhino_gh_mcp.grasshopper_tools", "GrasshopperTools"),
+        "rfem": ("rhino_gh_mcp.rfem_tools", "RfemTools"),
     }
     loaded = {}
     for name in tool_names:
@@ -181,14 +201,61 @@ def grasshopper_usage_strategy() -> str:
          * Document parameter changes in the user message
     """
 
+@app.prompt()
+def rfem_usage_strategy() -> str:
+    """Defines the preferred strategy for working with RFEM through MCP"""
+    return """When working with RFEM 6 through MCP (SOAP/WebService API), follow these guidelines:
+
+    1. Getting Started:
+       - Always start by checking the connection with rfem_check_connection()
+       - Use rfem_get_model_info() to understand the current model state
+       - The WebService runs on port 8081 by default
+
+    2. Object Creation Order (dependencies matter):
+       - Materials first (e.g., S235, C25/30)
+       - Sections second (e.g., IPE 300, HEA 200) — they reference materials
+       - Nodes third (define geometry points)
+       - Members fourth (connect nodes, reference sections)
+       - Supports (nodal supports on specific nodes)
+       - Load cases, then loads
+
+    3. Performance Awareness:
+       - SOAP/WebService is ~10x slower than gRPC — each call is individual
+       - For batch operations (many nodes, members), use rfem_execute_code() to create
+         multiple objects in a single call instead of calling rfem_set_node() many times
+       - Use dedicated tools for single-object operations
+       - Use rfem_execute_code() for complex multi-object operations
+
+    4. rfem_execute_code() Best Practices:
+       - All RFEM imports are pre-loaded (Node, Member, Material, Section, Surface, etc.)
+       - Use 'result = ...' to return data
+       - Ideal for: surfaces, member loads, calculations, results, batch creation
+       - Example batch node creation:
+         for i in range(10):
+             Node(i+1, i*2.0, 0.0, 0.0)
+
+    5. Common Material Names: S235, S355, C20/25, C25/30, C30/37, Timber C24
+    6. Common Section Names: IPE 80-600, HEA/HEB 100-1000, RHS 200x100x10, CHS 168.3x8
+
+    7. Supports:
+       - Use inf for fixed degrees of freedom, 0.0 for free
+       - Pinned: spring_x=inf, spring_y=inf, spring_z=inf (translations fixed, rotations free)
+       - Fixed: all six values = inf
+
+    8. Loads:
+       - Forces in Newtons [N], coordinates in meters [m]
+       - Positive Z is typically downward in RFEM
+    """
+
+
 def main(tools="grasshopper"):
     """Run the MCP server with dynamic tool loading
 
     Args:
-        tools: Comma-separated list of tools to load ("rhino", "grasshopper", or "all")
+        tools: Comma-separated list of tools to load ("rhino", "grasshopper", "rfem", or "all")
     """
     if tools == "all":
-        tool_names = ["rhino", "grasshopper"]
+        tool_names = ["rhino", "grasshopper", "rfem"]
     else:
         tool_names = [t.strip() for t in tools.split(",") if t.strip()]
     load_tools(app, tool_names)
