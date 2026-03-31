@@ -102,6 +102,9 @@ class RfemTools:
         self.app.tool()(self.rfem_set_nodal_support)
         self.app.tool()(self.rfem_set_load_case)
         self.app.tool()(self.rfem_set_nodal_load)
+        self.app.tool()(self.rfem_calculate)
+        self.app.tool()(self.rfem_get_results)
+        self.app.tool()(self.rfem_update_members_section)
         self.app.tool()(self.rfem_execute_code)
 
     def rfem_check_connection(self) -> str:
@@ -475,6 +478,198 @@ class RfemTools:
                 "status": "success",
                 "message": "Nodal load {} in LC{} applied on nodes: {} ({}, {}, {}) N".format(
                     no, load_case_no, node_ids, force_x, force_y, force_z)
+            })
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)})
+
+    def rfem_calculate(self, load_cases: Optional[List[int]] = None) -> str:
+        """Correr el cálculo en RFEM.
+
+        Args:
+            load_cases: Lista de números de caso de carga a calcular.
+                        Si es None, calcula todos los casos de carga.
+        """
+        conn = get_rfem_connection()
+        conn.ensure_connected()
+        try:
+            from RFEM.initModel import Model
+            client = Model.clientModel
+
+            if load_cases:
+                # Calcular casos específicos
+                for lc in load_cases:
+                    client.service.calculate_specific(lc)
+            else:
+                # Calcular todo
+                client.service.calculate_all()
+
+            return json.dumps({
+                "status": "success",
+                "message": "Cálculo ejecutado correctamente"
+            })
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)})
+
+    def rfem_get_results(self, load_case_no: int = 1,
+                         result_type: str = "members") -> str:
+        """Leer resultados del cálculo para un caso de carga.
+
+        Args:
+            load_case_no: Número de caso de carga (default: 1)
+            result_type: Tipo de resultado:
+                - "members": Esfuerzos internos de barras (N, V, M) y ratios
+                - "nodes": Desplazamientos nodales
+                - "summary": Resumen general (máx. desplazamiento, máx. esfuerzos)
+        """
+        conn = get_rfem_connection()
+        conn.ensure_connected()
+        try:
+            from RFEM.initModel import Model
+            client = Model.clientModel
+
+            if result_type == "nodes":
+                count = client.service.get_object_count("E_OBJECT_TYPE_NODE", 0)
+                results = []
+                for i in range(1, count + 1):
+                    try:
+                        res = client.service.get_results_for_nodes_in_load_cases(
+                            load_case_no, i)
+                        results.append(_serialize(res))
+                    except Exception:
+                        continue
+                return json.dumps({
+                    "status": "success",
+                    "result_type": "nodes",
+                    "load_case": load_case_no,
+                    "results": results
+                })
+
+            elif result_type == "members":
+                count = client.service.get_object_count("E_OBJECT_TYPE_MEMBER", 0)
+                results = []
+                for i in range(1, count + 1):
+                    try:
+                        res = client.service.get_results_for_members_internal_forces(
+                            load_case_no, i)
+                        member_info = client.service.get_member(i)
+                        results.append({
+                            "member_no": i,
+                            "section": _serialize(getattr(member_info, 'section_start', None)),
+                            "internal_forces": _serialize(res)
+                        })
+                    except Exception:
+                        continue
+                return json.dumps({
+                    "status": "success",
+                    "result_type": "members",
+                    "load_case": load_case_no,
+                    "results": results
+                })
+
+            elif result_type == "summary":
+                # Resumen: buscar máximos
+                summary = {
+                    "load_case": load_case_no,
+                    "max_displacement": None,
+                    "max_member_forces": None
+                }
+
+                # Desplazamientos máximos
+                node_count = client.service.get_object_count("E_OBJECT_TYPE_NODE", 0)
+                max_disp = 0.0
+                max_disp_node = None
+                for i in range(1, node_count + 1):
+                    try:
+                        res = client.service.get_results_for_nodes_in_load_cases(
+                            load_case_no, i)
+                        res_data = _serialize(res)
+                        if isinstance(res_data, dict):
+                            for key in ['displacement_x', 'displacement_y', 'displacement_z',
+                                        'ux', 'uy', 'uz']:
+                                val = res_data.get(key)
+                                if val is not None and abs(float(val)) > abs(max_disp):
+                                    max_disp = float(val)
+                                    max_disp_node = i
+                    except Exception:
+                        continue
+                summary["max_displacement"] = {
+                    "value_m": max_disp,
+                    "node": max_disp_node
+                }
+
+                return json.dumps({"status": "success", "summary": summary})
+            else:
+                return json.dumps({
+                    "status": "error",
+                    "message": "result_type debe ser 'members', 'nodes' o 'summary'"
+                })
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)})
+
+    def rfem_update_members_section(self, new_section_no: int,
+                                     member_ids: Optional[List[int]] = None,
+                                     current_section_no: Optional[int] = None) -> str:
+        """Cambiar la sección de barras existentes. Ideal para iteración de diseño.
+
+        Podés filtrar por lista de barras o por sección actual. Ejemplos de uso:
+        - "Pasame todas las IPE 300 (sección 2) a IPE 400 (sección 3)"
+        - "Cambiá las barras 5, 8 y 12 a la sección 4"
+
+        Args:
+            new_section_no: Número de la nueva sección a asignar
+            member_ids: Lista de IDs de barras a modificar (ej: [1, 5, 8]).
+                        Si es None, usa current_section_no para filtrar.
+            current_section_no: Número de sección actual para filtrar.
+                                Modifica TODAS las barras que tengan esta sección.
+                                Se ignora si member_ids está definido.
+        """
+        conn = get_rfem_connection()
+        conn.ensure_connected()
+        try:
+            from RFEM.initModel import Model
+            client = Model.clientModel
+
+            count = client.service.get_object_count("E_OBJECT_TYPE_MEMBER", 0)
+            modified = []
+
+            if member_ids:
+                # Modificar barras específicas
+                targets = member_ids
+            elif current_section_no is not None:
+                # Buscar barras con la sección actual
+                targets = []
+                for i in range(1, count + 1):
+                    try:
+                        member = client.service.get_member(i)
+                        sec = getattr(member, 'section_start', None)
+                        if sec is not None and int(sec) == current_section_no:
+                            targets.append(i)
+                    except Exception:
+                        continue
+            else:
+                return json.dumps({
+                    "status": "error",
+                    "message": "Necesitás pasar member_ids o current_section_no"
+                })
+
+            # Aplicar el cambio
+            for mid in targets:
+                try:
+                    member = client.service.get_member(mid)
+                    member.section_start = new_section_no
+                    member.section_end = new_section_no
+                    client.service.set_member(member)
+                    modified.append(mid)
+                except Exception as e:
+                    logger.warning("Error modificando barra {}: {}".format(mid, str(e)))
+                    continue
+
+            return json.dumps({
+                "status": "success",
+                "message": "Se modificaron {} barras a sección {}".format(
+                    len(modified), new_section_no),
+                "modified_members": modified,
+                "total_modified": len(modified)
             })
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)})
